@@ -45,3 +45,6 @@ htmlcov/
 # Project specific
 *.log
 
+# Local GitHub CLI config
+.config_gh_local/
+
