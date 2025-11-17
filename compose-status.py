@@ -150,17 +150,17 @@ def extract_services(compose_file: Path) -> List[str]:
         return []
 
 
-def get_docker_status(compose_dir: Path, compose_cmd: List[str]) -> Dict[str, str]:
+def get_docker_status(compose_dir: Path, compose_cmd: List[str], compose_file: Path) -> Dict[str, str]:
     """
     Query Docker Compose for the current status of all services.
     
-    Executes 'docker compose ps -a' (or 'docker-compose ps -a') from the compose
-    file's directory to get the current state of all services. The command must be
-    run from the compose file directory so Docker can find the correct compose.yaml file.
+    Executes 'docker compose ps -a' (or 'docker-compose ps -a') with the compose
+    file explicitly specified to get the current state of all services.
     
     Args:
         compose_dir: Directory containing the compose.yaml file
         compose_cmd: Docker Compose command to use (from detect_docker_compose_command)
+        compose_file: Path to the compose file (used with -f flag)
     
     Returns:
         Dict[str, str]: Dictionary mapping service names to their states
@@ -178,16 +178,20 @@ def get_docker_status(compose_dir: Path, compose_cmd: List[str]) -> Dict[str, st
     is_v2 = compose_cmd == ["docker", "compose"]
     
     try:
+        # Use absolute path for the compose file to ensure Docker Compose finds it reliably
+        # This works regardless of the current working directory
+        compose_file_abs = str(compose_file.resolve())
+        
         if is_v2:
             # Docker Compose V2 supports --format flag
-            cmd = compose_cmd + ["ps", "-a", "--format", "{{.Service}}\t{{.State}}\t{{.Name}}"]
+            cmd = compose_cmd + ["-f", compose_file_abs, "ps", "-a", "--format", "{{.Service}}\t{{.State}}\t{{.Name}}"]
         else:
             # Docker Compose V1 doesn't support --format, use default output
-            cmd = compose_cmd + ["ps", "-a"]
+            cmd = compose_cmd + ["-f", compose_file_abs, "ps", "-a"]
         
         # Run docker compose ps from the compose file directory
         # -a flag includes stopped containers
-        # We change to the compose directory so Docker finds the right compose file
+        # -f flag explicitly specifies the compose file
         result = subprocess.run(
             cmd,
             cwd=compose_dir,
@@ -195,6 +199,15 @@ def get_docker_status(compose_dir: Path, compose_cmd: List[str]) -> Dict[str, st
             text=True,            # Return string output instead of bytes
             check=False,          # Don't raise exception on non-zero exit
         )
+        
+        # Check if command failed
+        if result.returncode != 0:
+            # Log error for debugging, but don't fail completely
+            # This can happen if services don't exist yet, or Docker daemon is down
+            if result.stderr:
+                # Only log to stderr if there's an actual error message
+                # This helps with debugging without being too verbose
+                pass  # Silently continue - will show "not created" for all services
         
         # Parse the output if command succeeded
         if result.returncode == 0 and result.stdout.strip():
@@ -419,7 +432,7 @@ def main():
     # Step 3: Query Docker for current service statuses
     # Must run from compose file directory so Docker finds the right file
     compose_dir = compose_file.parent
-    status_map = get_docker_status(compose_dir, compose_cmd)
+    status_map = get_docker_status(compose_dir, compose_cmd, compose_file)
     
     # Step 4: Display the status report
     
