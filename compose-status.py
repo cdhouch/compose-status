@@ -150,7 +150,19 @@ def extract_services(compose_file: Path) -> List[str]:
         return []
 
 
-def get_docker_status(compose_dir: Path, compose_cmd: List[str], compose_file: Path) -> Dict[str, str]:
+def debug_print(message: str, debug: bool = False):
+    """
+    Print debug message to stderr if debug mode is enabled.
+    
+    Args:
+        message: Debug message to print
+        debug: Whether debug mode is enabled
+    """
+    if debug:
+        print(f"[DEBUG] {message}", file=sys.stderr)
+
+
+def get_docker_status(compose_dir: Path, compose_cmd: List[str], compose_file: Path, debug: bool = False) -> Dict[str, str]:
     """
     Query Docker Compose for the current status of all services.
     
@@ -161,6 +173,7 @@ def get_docker_status(compose_dir: Path, compose_cmd: List[str], compose_file: P
         compose_dir: Directory containing the compose.yaml file
         compose_cmd: Docker Compose command to use (from detect_docker_compose_command)
         compose_file: Path to the compose file (used with -f flag)
+        debug: Whether to enable debug logging
     
     Returns:
         Dict[str, str]: Dictionary mapping service names to their states
@@ -177,10 +190,14 @@ def get_docker_status(compose_dir: Path, compose_cmd: List[str], compose_file: P
     status_map = {}
     is_v2 = compose_cmd == ["docker", "compose"]
     
+    debug_print(f"Getting Docker status - compose_dir: {compose_dir}, compose_file: {compose_file}", debug)
+    debug_print(f"Docker Compose command: {compose_cmd}, is_v2: {is_v2}", debug)
+    
     try:
         # Use absolute path for the compose file to ensure Docker Compose finds it reliably
         # This works regardless of the current working directory
         compose_file_abs = str(compose_file.resolve())
+        debug_print(f"Resolved compose file path: {compose_file_abs}", debug)
         
         if is_v2:
             # Docker Compose V2 supports --format flag
@@ -188,6 +205,9 @@ def get_docker_status(compose_dir: Path, compose_cmd: List[str], compose_file: P
         else:
             # Docker Compose V1 doesn't support --format, use default output
             cmd = compose_cmd + ["-f", compose_file_abs, "ps", "-a"]
+        
+        debug_print(f"Executing command: {' '.join(cmd)}", debug)
+        debug_print(f"Working directory: {compose_dir}", debug)
         
         # Run docker compose ps from the compose file directory
         # -a flag includes stopped containers
@@ -200,8 +220,18 @@ def get_docker_status(compose_dir: Path, compose_cmd: List[str], compose_file: P
             check=False,          # Don't raise exception on non-zero exit
         )
         
+        debug_print(f"Command return code: {result.returncode}", debug)
+        debug_print(f"Command stdout length: {len(result.stdout)} characters", debug)
+        debug_print(f"Command stderr length: {len(result.stderr)} characters", debug)
+        
+        if result.stdout:
+            debug_print(f"Command stdout:\n{result.stdout}", debug)
+        if result.stderr:
+            debug_print(f"Command stderr:\n{result.stderr}", debug)
+        
         # Check if command failed
         if result.returncode != 0:
+            debug_print(f"Command failed with return code {result.returncode}", debug)
             # Log error for debugging, but don't fail completely
             # This can happen if services don't exist yet, or Docker daemon is down
             if result.stderr:
@@ -211,35 +241,46 @@ def get_docker_status(compose_dir: Path, compose_cmd: List[str], compose_file: P
         
         # Parse the output if command succeeded
         if result.returncode == 0 and result.stdout.strip():
+            debug_print("Parsing command output...", debug)
             if is_v2:
                 # V2 format: tab-separated Service, State, Name
+                debug_print("Using V2 format parser", debug)
                 for line in result.stdout.strip().split("\n"):
                     parts = line.split("\t")
                     if len(parts) >= 2:
                         service = parts[0]
                         state = parts[1]
                         status_map[service] = state
+                        debug_print(f"  Parsed: service={service}, state={state}", debug)
             else:
                 # V1 format: table with columns NAME, IMAGE, COMMAND, SERVICE, CREATED, STATUS, PORTS
                 # Parse the table output - columns are space-separated but variable width
+                debug_print("Using V1 format parser", debug)
                 lines = result.stdout.strip().split("\n")
+                debug_print(f"Total lines in output: {len(lines)}", debug)
                 if len(lines) < 2:
+                    debug_print("Not enough lines in output (need at least header + 1 data line)", debug)
                     return status_map
                 
                 # Parse header to find column positions
                 header = lines[0]
+                debug_print(f"Header line: {header}", debug)
                 # Find SERVICE and STATUS column positions
                 service_idx = header.find("SERVICE")
                 status_idx = header.find("STATUS")
+                debug_print(f"Column positions - SERVICE: {service_idx}, STATUS: {status_idx}", debug)
                 
                 if service_idx == -1 or status_idx == -1:
                     # Fallback: try to parse without header positions
+                    debug_print("SERVICE or STATUS column not found in header, using fallback parser", debug)
                     for line in lines[1:]:
                         if not line.strip():
                             continue
+                        debug_print(f"  Parsing line: {line}", debug)
                         # Try to extract service name and status using common patterns
                         # Service name is usually a simple word, status starts with Up/Exited/etc
                         parts = line.split()
+                        debug_print(f"  Line parts: {parts}", debug)
                         if len(parts) >= 4:
                             # Look for status indicators
                             for i, part in enumerate(parts):
@@ -251,6 +292,7 @@ def get_docker_status(compose_dir: Path, compose_cmd: List[str], compose_file: P
                                         state = "running"
                                         if service:
                                             status_map[service] = state
+                                            debug_print(f"  Fallback parsed: service={service}, state={state}", debug)
                                     break
                                 elif part_lower.startswith("exited"):
                                     if i >= 1:
@@ -258,6 +300,7 @@ def get_docker_status(compose_dir: Path, compose_cmd: List[str], compose_file: P
                                         state = "exited"
                                         if service:
                                             status_map[service] = state
+                                            debug_print(f"  Fallback parsed: service={service}, state={state}", debug)
                                     break
                                 elif part_lower.startswith("created"):
                                     if i >= 1:
@@ -265,12 +308,17 @@ def get_docker_status(compose_dir: Path, compose_cmd: List[str], compose_file: P
                                         state = "created"
                                         if service:
                                             status_map[service] = state
+                                            debug_print(f"  Fallback parsed: service={service}, state={state}", debug)
                                     break
                 else:
                     # Parse using column positions
+                    debug_print(f"Using column-based parser for {len(lines)-1} data lines", debug)
                     for line in lines[1:]:
                         if not line.strip() or len(line) < max(service_idx, status_idx):
+                            debug_print(f"  Skipping line (too short or empty): {line[:50]}...", debug)
                             continue
+                        
+                        debug_print(f"  Parsing line: {line}", debug)
                         
                         # Extract service name from SERVICE column
                         # Find the end of SERVICE column (next column starts)
@@ -283,6 +331,8 @@ def get_docker_status(compose_dir: Path, compose_cmd: List[str], compose_file: P
                             status = line[status_idx:ports_idx].strip()
                         else:
                             status = line[status_idx:].strip()
+                        
+                        debug_print(f"  Extracted: service='{service}', status='{status}'", debug)
                         
                         # Normalize status
                         status_lower = status.lower()
@@ -299,18 +349,27 @@ def get_docker_status(compose_dir: Path, compose_cmd: List[str], compose_file: P
                         else:
                             state = status_lower.split()[0] if status_lower.split() else "unknown"
                         
+                        debug_print(f"  Normalized state: '{state}'", debug)
+                        
                         if service:
                             status_map[service] = state
+                            debug_print(f"  Parsed: service={service}, state={state}", debug)
+                        else:
+                            debug_print(f"  Skipping: service name is empty", debug)
     except FileNotFoundError:
         # Docker command not found - user needs to install Docker
+        debug_print("Docker command not found", debug)
         print("Error: docker compose command not found", file=sys.stderr)
         sys.exit(1)
     except Exception as e:
         # Silently fail if docker compose fails
         # This can happen if services don't exist yet, or Docker daemon is down
         # We'll just show "not created" for all services in that case
-        pass
+        debug_print(f"Exception occurred: {type(e).__name__}: {e}", debug)
+        import traceback
+        debug_print(f"Traceback:\n{traceback.format_exc()}", debug)
     
+    debug_print(f"Final status_map: {status_map}", debug)
     return status_map
 
 
@@ -370,6 +429,7 @@ Examples:
   %(prog)s
   %(prog)s --file /path/to/compose.yaml
   %(prog)s -f ./docker-compose.yml
+  %(prog)s --debug -f docker-compose.yaml
 
 The script will check for compose files in this order:
   1. Command-line --file argument
@@ -382,6 +442,11 @@ The script will check for compose files in this order:
         dest="compose_file",
         metavar="FILE",
         help="Path to Docker Compose file (default: ~/compose.yaml or COMPOSE_FILE env var)"
+    )
+    parser.add_argument(
+        "-d", "--debug",
+        action="store_true",
+        help="Enable debug logging to diagnose issues"
     )
     return parser.parse_args()
 
@@ -400,6 +465,10 @@ def main():
     """
     # Parse command-line arguments
     args = parse_arguments()
+    debug = args.debug
+    
+    if debug:
+        debug_print("Debug mode enabled", debug)
     
     # Initialize Rich console for colored terminal output
     # Rich automatically detects terminal capabilities and adjusts output
@@ -408,6 +477,7 @@ def main():
     # Detect which Docker Compose command is available
     try:
         compose_cmd = detect_docker_compose_command()
+        debug_print(f"Detected Docker Compose command: {compose_cmd}", debug)
     except FileNotFoundError:
         console.print("[bold red]Error: Neither 'docker compose' nor 'docker-compose' command found![/bold red]")
         console.print("[yellow]Please install Docker Compose V2 or V1[/yellow]")
@@ -415,6 +485,8 @@ def main():
     
     # Step 1: Locate the Docker Compose file
     compose_file = get_compose_file(args.compose_file)
+    debug_print(f"Using compose file: {compose_file}", debug)
+    debug_print(f"Compose file exists: {compose_file.exists()}", debug)
     
     # Validate that the compose file exists
     if not compose_file.exists():
@@ -423,6 +495,7 @@ def main():
     
     # Step 2: Extract service names from the compose file
     services = extract_services(compose_file)
+    debug_print(f"Extracted services from compose file: {services}", debug)
     
     # Handle empty compose files gracefully
     if not services:
@@ -432,7 +505,9 @@ def main():
     # Step 3: Query Docker for current service statuses
     # Must run from compose file directory so Docker finds the right file
     compose_dir = compose_file.parent
-    status_map = get_docker_status(compose_dir, compose_cmd, compose_file)
+    debug_print(f"Compose directory: {compose_dir}", debug)
+    status_map = get_docker_status(compose_dir, compose_cmd, compose_file, debug)
+    debug_print(f"Retrieved status map with {len(status_map)} entries", debug)
     
     # Step 4: Display the status report
     
@@ -444,6 +519,7 @@ def main():
     for service in services:
         # Get the current state from Docker (None if not found)
         state = status_map.get(service)
+        debug_print(f"Service '{service}': state={state} (from status_map)", debug)
         
         # Get appropriate icon and text for this state
         icon, status_text = get_status_display(state)
