@@ -265,10 +265,11 @@ def get_docker_status(compose_dir: Path, compose_cmd: List[str], compose_file: P
                 # Parse header to find column positions
                 header = lines[0]
                 debug_print(f"Header line: {header}", debug)
-                # Find SERVICE and STATUS column positions
+                # Find SERVICE, CREATED, and STATUS column positions
                 service_idx = header.find("SERVICE")
+                created_idx = header.find("CREATED")
                 status_idx = header.find("STATUS")
-                debug_print(f"Column positions - SERVICE: {service_idx}, STATUS: {status_idx}", debug)
+                debug_print(f"Column positions - SERVICE: {service_idx}, CREATED: {created_idx}, STATUS: {status_idx}", debug)
                 
                 if service_idx == -1 or status_idx == -1:
                     # Fallback: try to parse without header positions
@@ -321,8 +322,12 @@ def get_docker_status(compose_dir: Path, compose_cmd: List[str], compose_file: P
                         debug_print(f"  Parsing line: {line}", debug)
                         
                         # Extract service name from SERVICE column
-                        # Find the end of SERVICE column (next column starts)
-                        service_end = status_idx
+                        # Find the end of SERVICE column (CREATED column starts next)
+                        # If CREATED column not found, fall back to STATUS column
+                        if created_idx != -1 and created_idx > service_idx:
+                            service_end = created_idx
+                        else:
+                            service_end = status_idx
                         service = line[service_idx:service_end].strip()
                         
                         # Extract status from STATUS column (until PORTS or end)
