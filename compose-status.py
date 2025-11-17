@@ -67,6 +67,50 @@ def get_compose_file(compose_file_arg: Optional[str] = None) -> Path:
     return Path(compose_file).expanduser()
 
 
+def detect_docker_compose_command() -> List[str]:
+    """
+    Detect which Docker Compose command is available on the system.
+    
+    Tries Docker Compose V2 (`docker compose`) first, then falls back to
+    V1 (`docker-compose`) if V2 is not available.
+    
+    Returns:
+        List[str]: Command to use for docker compose operations
+        e.g., ['docker', 'compose'] or ['docker-compose']
+    
+    Raises:
+        FileNotFoundError: If neither docker compose command is found
+    """
+    # Try Docker Compose V2 first (docker compose)
+    try:
+        result = subprocess.run(
+            ["docker", "compose", "version"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode == 0:
+            return ["docker", "compose"]
+    except FileNotFoundError:
+        pass
+    
+    # Fall back to Docker Compose V1 (docker-compose)
+    try:
+        result = subprocess.run(
+            ["docker-compose", "version"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode == 0:
+            return ["docker-compose"]
+    except FileNotFoundError:
+        pass
+    
+    # Neither command found
+    raise FileNotFoundError("Neither 'docker compose' nor 'docker-compose' command found")
+
+
 def extract_services(compose_file: Path) -> List[str]:
     """
     Extract top-level service names from a Docker Compose YAML file.
@@ -106,16 +150,17 @@ def extract_services(compose_file: Path) -> List[str]:
         return []
 
 
-def get_docker_status(compose_dir: Path) -> Dict[str, str]:
+def get_docker_status(compose_dir: Path, compose_cmd: List[str]) -> Dict[str, str]:
     """
     Query Docker Compose for the current status of all services.
     
-    Executes 'docker compose ps -a' from the compose file's directory to get
-    the current state of all services. The command must be run from the compose
-    file directory so Docker can find the correct compose.yaml file.
+    Executes 'docker compose ps -a' (or 'docker-compose ps -a') from the compose
+    file's directory to get the current state of all services. The command must be
+    run from the compose file directory so Docker can find the correct compose.yaml file.
     
     Args:
         compose_dir: Directory containing the compose.yaml file
+        compose_cmd: Docker Compose command to use (from detect_docker_compose_command)
     
     Returns:
         Dict[str, str]: Dictionary mapping service names to their states
@@ -130,14 +175,21 @@ def get_docker_status(compose_dir: Path) -> Dict[str, str]:
         - 'stopped': Container was explicitly stopped
     """
     status_map = {}
+    is_v2 = compose_cmd == ["docker", "compose"]
     
     try:
+        if is_v2:
+            # Docker Compose V2 supports --format flag
+            cmd = compose_cmd + ["ps", "-a", "--format", "{{.Service}}\t{{.State}}\t{{.Name}}"]
+        else:
+            # Docker Compose V1 doesn't support --format, use default output
+            cmd = compose_cmd + ["ps", "-a"]
+        
         # Run docker compose ps from the compose file directory
         # -a flag includes stopped containers
-        # --format uses Go template syntax for tab-separated output
         # We change to the compose directory so Docker finds the right compose file
         result = subprocess.run(
-            ["docker", "compose", "ps", "-a", "--format", "{{.Service}}\t{{.State}}\t{{.Name}}"],
+            cmd,
             cwd=compose_dir,
             capture_output=True,  # Capture both stdout and stderr
             text=True,            # Return string output instead of bytes
@@ -146,14 +198,96 @@ def get_docker_status(compose_dir: Path) -> Dict[str, str]:
         
         # Parse the output if command succeeded
         if result.returncode == 0 and result.stdout.strip():
-            for line in result.stdout.strip().split("\n"):
-                # Split tab-separated values: Service, State, Name
-                parts = line.split("\t")
-                if len(parts) >= 2:
-                    service = parts[0]
-                    state = parts[1]
-                    # Store service name -> state mapping
-                    status_map[service] = state
+            if is_v2:
+                # V2 format: tab-separated Service, State, Name
+                for line in result.stdout.strip().split("\n"):
+                    parts = line.split("\t")
+                    if len(parts) >= 2:
+                        service = parts[0]
+                        state = parts[1]
+                        status_map[service] = state
+            else:
+                # V1 format: table with columns NAME, IMAGE, COMMAND, SERVICE, CREATED, STATUS, PORTS
+                # Parse the table output - columns are space-separated but variable width
+                lines = result.stdout.strip().split("\n")
+                if len(lines) < 2:
+                    return status_map
+                
+                # Parse header to find column positions
+                header = lines[0]
+                # Find SERVICE and STATUS column positions
+                service_idx = header.find("SERVICE")
+                status_idx = header.find("STATUS")
+                
+                if service_idx == -1 or status_idx == -1:
+                    # Fallback: try to parse without header positions
+                    for line in lines[1:]:
+                        if not line.strip():
+                            continue
+                        # Try to extract service name and status using common patterns
+                        # Service name is usually a simple word, status starts with Up/Exited/etc
+                        parts = line.split()
+                        if len(parts) >= 4:
+                            # Look for status indicators
+                            for i, part in enumerate(parts):
+                                part_lower = part.lower()
+                                if part_lower.startswith("up"):
+                                    # Found status, service is likely a few columns before
+                                    if i >= 1:
+                                        service = parts[i-1] if i-1 < len(parts) else None
+                                        state = "running"
+                                        if service:
+                                            status_map[service] = state
+                                    break
+                                elif part_lower.startswith("exited"):
+                                    if i >= 1:
+                                        service = parts[i-1] if i-1 < len(parts) else None
+                                        state = "exited"
+                                        if service:
+                                            status_map[service] = state
+                                    break
+                                elif part_lower.startswith("created"):
+                                    if i >= 1:
+                                        service = parts[i-1] if i-1 < len(parts) else None
+                                        state = "created"
+                                        if service:
+                                            status_map[service] = state
+                                    break
+                else:
+                    # Parse using column positions
+                    for line in lines[1:]:
+                        if not line.strip() or len(line) < max(service_idx, status_idx):
+                            continue
+                        
+                        # Extract service name from SERVICE column
+                        # Find the end of SERVICE column (next column starts)
+                        service_end = status_idx
+                        service = line[service_idx:service_end].strip()
+                        
+                        # Extract status from STATUS column (until PORTS or end)
+                        ports_idx = header.find("PORTS")
+                        if ports_idx != -1 and len(line) > ports_idx:
+                            status = line[status_idx:ports_idx].strip()
+                        else:
+                            status = line[status_idx:].strip()
+                        
+                        # Normalize status
+                        status_lower = status.lower()
+                        if status_lower.startswith("up"):
+                            state = "running"
+                        elif status_lower.startswith("exited"):
+                            state = "exited"
+                        elif status_lower.startswith("created"):
+                            state = "created"
+                        elif status_lower.startswith("dead"):
+                            state = "dead"
+                        elif status_lower.startswith("stopped"):
+                            state = "stopped"
+                        else:
+                            state = status_lower.split()[0] if status_lower.split() else "unknown"
+                        
+                        if service:
+                            status_map[service] = state
     except FileNotFoundError:
         # Docker command not found - user needs to install Docker
         print("Error: docker compose command not found", file=sys.stderr)
@@ -245,10 +379,11 @@ def main():
     
     Orchestrates the entire workflow:
     1. Parses command-line arguments
-    2. Locates the compose file
-    3. Extracts service names
-    4. Queries Docker for service statuses
-    5. Displays a beautiful, colorized status report
+    2. Detects available Docker Compose command
+    3. Locates the compose file
+    4. Extracts service names
+    5. Queries Docker for service statuses
+    6. Displays a beautiful, colorized status report
     """
     # Parse command-line arguments
     args = parse_arguments()
@@ -256,6 +391,14 @@ def main():
     # Initialize Rich console for colored terminal output
     # Rich automatically detects terminal capabilities and adjusts output
     console = Console()
+    
+    # Detect which Docker Compose command is available
+    try:
+        compose_cmd = detect_docker_compose_command()
+    except FileNotFoundError:
+        console.print("[bold red]Error: Neither 'docker compose' nor 'docker-compose' command found![/bold red]")
+        console.print("[yellow]Please install Docker Compose V2 or V1[/yellow]")
+        sys.exit(1)
     
     # Step 1: Locate the Docker Compose file
     compose_file = get_compose_file(args.compose_file)
@@ -276,7 +419,7 @@ def main():
     # Step 3: Query Docker for current service statuses
     # Must run from compose file directory so Docker finds the right file
     compose_dir = compose_file.parent
-    status_map = get_docker_status(compose_dir)
+    status_map = get_docker_status(compose_dir, compose_cmd)
     
     # Step 4: Display the status report
     
@@ -330,4 +473,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
