@@ -58,17 +58,33 @@ The script will automatically look for `~/compose.yaml` (or `~/docker-compose.ya
 
 ### Custom Compose File Location
 
-Set the `COMPOSE_FILE` environment variable to use a different compose file:
+You can specify a custom compose file location in three ways (in priority order):
+
+1. **Command-line argument** (recommended):
+   ```bash
+   ./compose-status.py --file /path/to/your/compose.yaml
+   # or using the short form:
+   ./compose-status.py -f ./docker-compose.yml
+   ```
+
+2. **Environment variable**:
+   ```bash
+   export COMPOSE_FILE=/path/to/your/compose.yaml
+   ./compose-status.py
+   ```
+   Or specify it inline:
+   ```bash
+   COMPOSE_FILE=/path/to/your/compose.yaml ./compose-status.py
+   ```
+
+3. **Default location**: `~/compose.yaml`
+
+### Help
+
+View all available options:
 
 ```bash
-export COMPOSE_FILE=/path/to/your/compose.yaml
-./compose-status.py
-```
-
-Or specify it inline:
-
-```bash
-COMPOSE_FILE=/path/to/your/compose.yaml ./compose-status.py
+./compose-status.py --help
 ```
 
 ### Example Output
@@ -97,7 +113,10 @@ Tip: Run 'cd /home/user && docker compose ps -a' for full details.
 
 ## How It Works
 
-1. **Locates Compose File**: Checks `COMPOSE_FILE` environment variable, then defaults to `~/compose.yaml`
+1. **Locates Compose File**: Checks in priority order:
+   - Command-line `--file` argument
+   - `COMPOSE_FILE` environment variable
+   - Default: `~/compose.yaml`
 2. **Extracts Services**: Parses the YAML file to find all service names
 3. **Queries Docker**: Runs `docker compose ps -a` to get current service states
 4. **Displays Status**: Shows a formatted, colorized report of all services

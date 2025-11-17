@@ -12,6 +12,7 @@ License: MIT
 GitHub: https://github.com/cdhouch/compose-status
 """
 
+import argparse
 import os
 import sys
 import subprocess
@@ -36,12 +37,17 @@ except ImportError:
     sys.exit(1)
 
 
-def get_compose_file() -> Path:
+def get_compose_file(compose_file_arg: Optional[str] = None) -> Path:
     """
     Get the Docker Compose file path.
     
-    Checks the COMPOSE_FILE environment variable first, then defaults to
-    ~/compose.yaml. This allows users to specify a custom compose file location.
+    Priority order:
+    1. Command-line argument (if provided)
+    2. COMPOSE_FILE environment variable
+    3. Default: ~/compose.yaml
+    
+    Args:
+        compose_file_arg: Optional path to compose file from command-line argument
     
     Returns:
         Path: The path to the compose file (with ~ expanded to home directory)
@@ -49,10 +55,14 @@ def get_compose_file() -> Path:
     Example:
         >>> get_compose_file()
         Path('/home/user/compose.yaml')
+        >>> get_compose_file('/path/to/compose.yaml')
+        Path('/path/to/compose.yaml')
     """
-    # Check for custom compose file location via environment variable
-    # This allows flexibility for different project structures
-    compose_file = os.environ.get("COMPOSE_FILE", str(Path.home() / "compose.yaml"))
+    # Priority: command-line arg > environment variable > default
+    if compose_file_arg:
+        compose_file = compose_file_arg
+    else:
+        compose_file = os.environ.get("COMPOSE_FILE", str(Path.home() / "compose.yaml"))
     # Expand ~ to actual home directory path (cross-platform)
     return Path(compose_file).expanduser()
 
@@ -198,22 +208,57 @@ def get_status_display(state: Optional[str]) -> tuple[str, str]:
         return "🟡", state
 
 
+def parse_arguments() -> argparse.Namespace:
+    """
+    Parse command-line arguments.
+    
+    Returns:
+        argparse.Namespace: Parsed command-line arguments
+    """
+    parser = argparse.ArgumentParser(
+        description="A beautiful, colorized command-line tool for quickly viewing the status of all services in your Docker Compose setup.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  %(prog)s
+  %(prog)s --file /path/to/compose.yaml
+  %(prog)s -f ./docker-compose.yml
+
+The script will check for compose files in this order:
+  1. Command-line --file argument
+  2. COMPOSE_FILE environment variable
+  3. Default: ~/compose.yaml
+        """
+    )
+    parser.add_argument(
+        "-f", "--file",
+        dest="compose_file",
+        metavar="FILE",
+        help="Path to Docker Compose file (default: ~/compose.yaml or COMPOSE_FILE env var)"
+    )
+    return parser.parse_args()
+
+
 def main():
     """
     Main entry point for the compose-status script.
     
     Orchestrates the entire workflow:
-    1. Locates the compose file
-    2. Extracts service names
-    3. Queries Docker for service statuses
-    4. Displays a beautiful, colorized status report
+    1. Parses command-line arguments
+    2. Locates the compose file
+    3. Extracts service names
+    4. Queries Docker for service statuses
+    5. Displays a beautiful, colorized status report
     """
+    # Parse command-line arguments
+    args = parse_arguments()
+    
     # Initialize Rich console for colored terminal output
     # Rich automatically detects terminal capabilities and adjusts output
     console = Console()
     
     # Step 1: Locate the Docker Compose file
-    compose_file = get_compose_file()
+    compose_file = get_compose_file(args.compose_file)
     
     # Validate that the compose file exists
     if not compose_file.exists():
