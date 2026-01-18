@@ -13,6 +13,7 @@ GitHub: https://github.com/cdhouch/compose-status
 """
 
 import argparse
+import glob
 import os
 import sys
 import subprocess
@@ -111,16 +112,18 @@ def detect_docker_compose_command() -> List[str]:
     raise FileNotFoundError("Neither 'docker compose' nor 'docker-compose' command found")
 
 
-def extract_services(compose_file: Path) -> List[str]:
+def extract_services(compose_file: Path, debug: bool = False) -> List[str]:
     """
     Extract top-level service names from a Docker Compose YAML file.
     
     Parses the compose file and extracts all service names defined under the
-    'services' key. Services are returned in alphabetical order for consistent
-    display.
+    'services' key. If the file uses Compose `include`, included files are
+    followed recursively. Services are returned in alphabetical order for
+    consistent display.
     
     Args:
         compose_file: Path to the docker-compose.yaml file
+        debug: Whether to enable debug logging
     
     Returns:
         List[str]: Sorted list of service names, or empty list if none found
@@ -129,25 +132,8 @@ def extract_services(compose_file: Path) -> List[str]:
         >>> extract_services(Path("compose.yaml"))
         ['audiobookshelf', 'calibre-web', 'nginx-proxy-manager']
     """
-    try:
-        # Read and parse the YAML file
-        # safe_load() prevents arbitrary code execution (security best practice)
-        with open(compose_file, "r") as f:
-            data = yaml.safe_load(f)
-        
-        # Validate that the file contains a services section
-        if not data or "services" not in data:
-            return []
-        
-        # Extract service names (keys of the services dictionary)
-        # Sort for consistent, predictable output order
-        services = list(data["services"].keys())
-        return sorted(services)
-    except yaml.YAMLError as e:
-        # Handle YAML parsing errors gracefully
-        # This could happen with malformed compose files
-        print(f"Error parsing YAML: {e}", file=sys.stderr)
-        return []
+    services = _collect_services_from_file(compose_file, debug=debug)
+    return sorted(set(services))
 
 
 def debug_print(message: str, debug: bool = False):
@@ -160,6 +146,99 @@ def debug_print(message: str, debug: bool = False):
     """
     if debug:
         print(f"[DEBUG] {message}", file=sys.stderr)
+
+
+def _normalize_include_entries(include_value) -> List[str]:
+    """
+    Normalize the Compose include value into a list of path strings.
+
+    Supports:
+      - A single string
+      - A list of strings
+      - A list of objects with a 'path' key (Compose include spec)
+      - A single object with a 'path' key
+    """
+    if not include_value:
+        return []
+    if isinstance(include_value, str):
+        return [include_value]
+    if isinstance(include_value, dict):
+        path_value = include_value.get("path")
+        if isinstance(path_value, list):
+            return [str(item) for item in path_value if item]
+        if path_value:
+            return [str(path_value)]
+        return []
+    if isinstance(include_value, list):
+        normalized = []
+        for entry in include_value:
+            if isinstance(entry, str):
+                normalized.append(entry)
+            elif isinstance(entry, dict):
+                path_value = entry.get("path")
+                if isinstance(path_value, list):
+                    normalized.extend([str(item) for item in path_value if item])
+                elif path_value:
+                    normalized.append(str(path_value))
+        return normalized
+    return []
+
+
+def _resolve_include_paths(include_entries: List[str], base_dir: Path, debug: bool = False) -> List[Path]:
+    """
+    Resolve include entries to concrete paths, expanding globs and ~.
+    """
+    resolved_paths: List[Path] = []
+    for entry in include_entries:
+        if not entry:
+            continue
+        entry = str(entry).strip()
+        if not entry:
+            continue
+        raw_path = Path(entry)
+        if not raw_path.is_absolute():
+            raw_path = base_dir / raw_path
+        expanded = Path(os.path.expanduser(str(raw_path)))
+        if any(ch in entry for ch in ["*", "?", "["]):
+            matches = [Path(p) for p in glob.glob(str(expanded))]
+            if not matches:
+                debug_print(f"No include matches for: {entry}", debug)
+            resolved_paths.extend(sorted(matches))
+        else:
+            resolved_paths.append(expanded)
+    return resolved_paths
+
+
+def _collect_services_from_file(compose_file: Path, debug: bool = False, seen: Optional[set] = None) -> List[str]:
+    """
+    Recursively collect services from a compose file and its includes.
+    """
+    if seen is None:
+        seen = set()
+    compose_file = Path(compose_file).expanduser()
+    if compose_file in seen:
+        debug_print(f"Skipping already processed include: {compose_file}", debug)
+        return []
+    seen.add(compose_file)
+
+    try:
+        with open(compose_file, "r") as f:
+            data = yaml.safe_load(f) or {}
+    except FileNotFoundError:
+        debug_print(f"Include file not found: {compose_file}", debug)
+        return []
+    except yaml.YAMLError as e:
+        print(f"Error parsing YAML: {e}", file=sys.stderr)
+        return []
+
+    services = list((data.get("services") or {}).keys())
+
+    include_entries = _normalize_include_entries(data.get("include"))
+    include_paths = _resolve_include_paths(include_entries, compose_file.parent, debug=debug)
+    for include_path in include_paths:
+        services.extend(_collect_services_from_file(include_path, debug=debug, seen=seen))
+
+    return services
 
 
 def get_docker_status(compose_dir: Path, compose_cmd: List[str], compose_file: Path, debug: bool = False) -> Dict[str, str]:
@@ -194,10 +273,12 @@ def get_docker_status(compose_dir: Path, compose_cmd: List[str], compose_file: P
     debug_print(f"Docker Compose command: {compose_cmd}, is_v2: {is_v2}", debug)
     
     try:
-        # Use absolute path for the compose file to ensure Docker Compose finds it reliably
-        # This works regardless of the current working directory
-        compose_file_abs = str(compose_file.resolve())
-        debug_print(f"Resolved compose file path: {compose_file_abs}", debug)
+        # Use absolute path for the compose file, but don't resolve symlinks
+        # Docker Compose uses the file's directory to determine project name,
+        # so resolving symlinks can cause it to look for the wrong project
+        # os.path.abspath() makes paths absolute without following symlinks
+        compose_file_abs = os.path.abspath(str(compose_file.expanduser()))
+        debug_print(f"Compose file path (not resolving symlinks): {compose_file_abs}", debug)
         
         if is_v2:
             # Docker Compose V2 supports --format flag
@@ -499,7 +580,7 @@ def main():
         sys.exit(1)
     
     # Step 2: Extract service names from the compose file
-    services = extract_services(compose_file)
+    services = extract_services(compose_file, debug=debug)
     debug_print(f"Extracted services from compose file: {services}", debug)
     
     # Handle empty compose files gracefully
